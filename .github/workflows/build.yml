@@ -1,6 +1,16 @@
 name: Build
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      build_editor:
+        description: Build the macOS editor
+        type: boolean
+        default: true
+      build_templates:
+        description: Build the web export templates
+        type: boolean
+        default: true
 
 env:
   BUILD_NAME: web_export
@@ -10,6 +20,7 @@ env:
 # the official release built from the same submodule commit.
 jobs:
   build-macos-editor:
+    if: ${{ inputs.build_editor }}
     runs-on: macos-latest
 
     env:
@@ -63,3 +74,55 @@ jobs:
             godot/bin/version.txt
             godot/bin/GodotSharp/**
             godot/bin/nuget/**
+
+  # Upstream Godot CI pins emsdk 4.0.11 for this engine commit; the 6.x
+  # templates from the 4.7.1 release corrupt WebGL uploads (resizable
+  # ArrayBuffer views) and the release js/wasm pair fails to instantiate.
+  # No glue/assembly steps here: the editor job produces those.
+  build-web-template:
+    if: ${{ inputs.build_templates }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [template_release, template_debug]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+
+      - name: Set Up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Set Up SCons
+        run: pip install scons
+
+      - name: Set Up WASM Tools
+        shell: bash
+        run: |
+          # Install wasm-tools for both 10.0 and 9.0 SDKs
+          mv global.json global.json.disabled
+          dotnet workload install wasm-tools
+
+          mv global.json.disabled global.json
+          dotnet workload install wasm-tools
+
+      - name: Set Up Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.11
+
+      - name: Build Web Template
+        run: scons -C godot platform=web target=${{ matrix.target }} module_mono_enabled=yes optimize=speed ccflags="-DNDEBUG"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: godot.web.${{ matrix.target }}.wasm32.mono
+          path: godot/bin/godot.web.${{ matrix.target }}.wasm32.mono.zip
