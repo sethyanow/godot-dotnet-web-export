@@ -3,7 +3,11 @@ name: Build
 on:
   workflow_dispatch:
     inputs:
-      build_editor:
+      build_windows:
+        description: Build the Windows editor
+        type: boolean
+        default: true
+      build_macos:
         description: Build the macOS editor
         type: boolean
         default: true
@@ -11,16 +15,71 @@ on:
         description: Build the web export templates
         type: boolean
         default: true
+      publish_release:
+        description: Package the Windows zip and publish a GitHub release (needs Windows + templates)
+        type: boolean
+        default: false
 
 env:
   BUILD_NAME: web_export
 
-# Builds only the macOS editor + managed assemblies/NuGet packages.
-# Web export templates (wasm) are platform-independent — reuse the zips from
-# the official release built from the same submodule commit.
 jobs:
+  build-windows-editor:
+    if: ${{ inputs.build_windows }}
+    runs-on: windows-latest
+
+    env:
+      SCONS_FLAGS: >-
+        ccflags="/O2 /Ob3 /GL /sdl- /GS- /arch:SSE4.2 /MP /DNDEBUG"
+        linkflags="/LTCG /OPT:REF /OPT:ICF"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+
+      - name: Set Up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Set Up SCons
+        run: pip install scons
+
+      - name: Set Up Direct3D 12 SDK
+        run: python godot\misc\scripts\install_d3d12_sdk_windows.py
+
+      - name: Build Editor (Windows)
+        run: scons -C godot target=editor module_mono_enabled=yes ${{ env.SCONS_FLAGS }}
+
+      # Straight into modules/mono/glue: build_assemblies.py reads it from there.
+      - name: Generate Mono Glue
+        run: cmd /c "godot\bin\godot.windows.editor.x86_64.mono --headless --quit --generate-mono-glue godot\modules\mono\glue"
+
+      # The editor artifact carries GodotSharp + nuget for the final zip; the
+      # template jobs are standalone and don't build assemblies.
+      - name: Build Mono Assemblies
+        run: python godot/modules/mono/build_scripts/build_assemblies.py --godot-output-dir=godot/bin --push-nupkgs-local godot/bin/nuget
+
+      - name: Save Version Text File
+        run: |
+          cmd /c "godot\bin\godot.windows.editor.x86_64.mono --headless --quit --version > godot\bin\version.txt"
+          type godot\bin\version.txt
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: godot.windows.mono.${{ env.BUILD_NAME }}.editor
+          path: |
+            godot\bin\*.exe
+            godot\bin\version.txt
+            godot\bin\GodotSharp\**
+            godot\bin\nuget\**
+
   build-macos-editor:
-    if: ${{ inputs.build_editor }}
+    if: ${{ inputs.build_macos }}
     runs-on: macos-latest
 
     env:
@@ -75,10 +134,11 @@ jobs:
             godot/bin/GodotSharp/**
             godot/bin/nuget/**
 
-  # Upstream Godot CI pins emsdk 4.0.11 for this engine commit; the 6.x
-  # templates from the 4.7.1 release corrupt WebGL uploads (resizable
-  # ArrayBuffer views) and the release js/wasm pair fails to instantiate.
-  # No glue/assembly steps here: the editor job produces those.
+  # Upstream Godot CI pins emsdk 4.0.11 for this engine commit. Templates built
+  # with emsdk 6.x corrupt WebGL uploads (resizable ArrayBuffer views reach GL
+  # entry points) and the closure-minified release js fails to instantiate its
+  # wasm. Standalone on purpose: no editor artifact, no glue — scons only needs
+  # SdkPackageVersions.props, generated inline below.
   build-web-template:
     if: ${{ inputs.build_templates }}
     runs-on: ubuntu-latest
@@ -106,7 +166,7 @@ jobs:
       - name: Set Up WASM Tools
         shell: bash
         run: |
-          # Install wasm-tools for both 10.0 and 9.0 SDKs
+          # Install wasm-tools for both the latest and the global.json-pinned SDK
           mv global.json global.json.disabled
           dotnet workload install wasm-tools
 
@@ -118,8 +178,6 @@ jobs:
         with:
           version: 4.0.11
 
-      # scons' GetRuntimePack needs modules/mono/SdkPackageVersions.props,
-      # normally emitted by build_assemblies.py (skipped here — no glue).
       - name: Generate SdkPackageVersions.props
         run: python -c "import sys; sys.path.insert(0, 'godot/modules/mono/build_scripts'); import build_assemblies; build_assemblies.generate_sdk_package_versions()"
 
@@ -131,3 +189,177 @@ jobs:
         with:
           name: godot.web.${{ matrix.target }}.wasm32.mono
           path: godot/bin/godot.web.${{ matrix.target }}.wasm32.mono.zip
+
+  build-final-zip:
+    if: ${{ inputs.publish_release }}
+    runs-on: ubuntu-latest
+
+    needs: [build-windows-editor, build-web-template]
+
+    outputs:
+      version: ${{ steps.prepare.outputs.version }}
+      status: ${{ steps.prepare.outputs.status }}
+      build_name: ${{ steps.prepare.outputs.build_name }}
+      hash: ${{ steps.prepare.outputs.hash }}
+      filename: ${{ steps.prepare.outputs.filename }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+
+      # By name, not merge-all: the macOS artifact carries colliding
+      # version.txt / GodotSharp / nuget paths.
+      - name: Download Editor Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: godot.windows.mono.${{ env.BUILD_NAME }}.editor
+          path: godot/bin
+
+      - name: Download Template Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: godot.web.template_*
+          path: godot/bin
+          merge-multiple: true
+
+      - name: Prepare Files
+        id: prepare
+        run: |
+          # Get the version data from the app (previously saved to a file)
+          # Remove the trailing newline
+          version_output=$(tr -d '\r\n' < godot/bin/version.txt)
+
+          # Regex matching: split the initial numerical/dot characters
+          [[ $version_output =~ ^([0-9.]+)\.([^0-9.][^.]*)\.(mono\.)?(.+)\.([^.]+) ]]
+          version=${BASH_REMATCH[1]}
+          status=${BASH_REMATCH[2]}
+          mono=${BASH_REMATCH[3]}
+          build_name=${BASH_REMATCH[4]}
+          hash=${BASH_REMATCH[5]}
+
+          # Get a filename matching official Godot releases, e.g.: Godot_v4.6.1-stable_mono_web_export_win64
+          filename=Godot_v${version}-${status}_${mono//./_}${build_name//./_}_win64
+
+          # Move the files to a folder
+          mkdir $filename
+          mv godot/bin/godot.windows.editor.x86_64.mono.exe ${filename}/${filename}.exe
+          mv godot/bin/godot.windows.editor.x86_64.mono.console.exe ${filename}/${filename}_console.exe
+          mv godot/bin/GodotSharp $filename
+          mv godot/bin/nuget $filename
+          mv godot/bin/godot.web.template_release.wasm32.mono.zip ${filename}/web_release.zip
+          mv godot/bin/godot.web.template_debug.wasm32.mono.zip ${filename}/web_debug.zip
+          mv Program.cs $filename
+          mv global.json $filename
+          mv README.md $filename
+
+          # Save the output for use in other steps
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "build_name=${build_name}" >> "$GITHUB_OUTPUT"
+          echo "hash=${hash}" >> "$GITHUB_OUTPUT"
+          echo "filename=${filename}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Install Batch File
+        run: |
+          batch_filename=${{ steps.prepare.outputs.filename }}/install.bat
+          cat > $batch_filename << 'EOF'
+          @echo off
+
+          echo Installing web export files for '${{ steps.prepare.outputs.filename }}'...
+          echo:
+
+          set TEMPLATE_FOLDER=%AppData%\Godot\export_templates\${{ steps.prepare.outputs.version }}.${{ steps.prepare.outputs.status }}.mono
+          set NUGET_FOLDER=%AppData%\NuGet\nuget
+
+          echo Moving export templates to '%TEMPLATE_FOLDER%'...
+
+          md "%TEMPLATE_FOLDER%"
+          move /y "%~dp0web_release.zip" "%TEMPLATE_FOLDER%"
+          move /y "%~dp0web_debug.zip" "%TEMPLATE_FOLDER%"
+
+          echo:
+          echo Attempting to add NuGet source...
+
+          dotnet nuget add source "%NUGET_FOLDER%" --name NugetSource
+
+          echo:
+          echo Moving NuGet packages to '%NUGET_FOLDER%'...
+
+          md "%NUGET_FOLDER%"
+          move /y "%~dp0nuget\*" "%NUGET_FOLDER%"
+          rd "%~dp0nuget"
+
+          echo:
+          echo Attempting to install wasm-tools...
+
+          ren "%~dp0global.json" global.json.disabled
+          dotnet workload install wasm-tools
+
+          ren "%~dp0global.json.disabled" global.json
+          dotnet workload install wasm-tools
+
+          echo:
+          echo Installation complete!
+          echo Use the included '${{ steps.prepare.outputs.filename }}.exe' to open your project and export for the web.
+
+          pause
+          EOF
+
+      - name: Create Zip File
+        run: 7z a ${{ steps.prepare.outputs.filename }}.zip ${{ steps.prepare.outputs.filename }} -r -mm=Deflate64 -mx=9 -bb
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.prepare.outputs.filename }}.artifact
+          path: ${{ steps.prepare.outputs.filename }}.zip
+
+  upload-release:
+    if: ${{ inputs.publish_release }}
+    runs-on: ubuntu-latest
+
+    needs: build-final-zip
+
+    steps:
+      - name: Download Artifact Zip File
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build-final-zip.outputs.filename }}.artifact
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ needs.build-final-zip.outputs.filename }}.zip
+          tag_name: ${{ needs.build-final-zip.outputs.version }}-${{ needs.build-final-zip.outputs.status }}
+          target_commitish: ${{ github.ref }}
+          prerelease: ${{ needs.build-final-zip.outputs.status != 'stable' }}
+          body: >-
+            Windows build of [Godot Engine](https://godotengine.org/)
+            ${{ needs.build-final-zip.outputs.version }}-${{ needs.build-final-zip.outputs.status }}
+            with experimental support for exporting C# projects to the web.
+            Web export templates built with emsdk 4.0.11 (matching upstream Godot CI).
+
+
+            How to use:
+
+            1. Extract the zip file.
+
+            2. Run the included `install.bat`.
+
+            3. Change your Godot project's `.csproj` `TargetFramework` to `net9.0`, i.e., `<TargetFramework>net9.0</TargetFramework>`.
+
+            4. Copy the included `Program.cs` to your project root if it doesn't have one.
+
+            5. Open your project with the included app to export to the web.
+
+            > <sub>If you are using self-contained mode, copy the web export templates to
+            `editor_data\export_templates\${{ needs.build-final-zip.outputs.version }}.${{ needs.build-final-zip.outputs.status }}.mono`.</sub>
+
+
+            **⚠️WARNING
+
+            Games exported for the web do not support all features.
+
+            See the main README for more information.**
