@@ -118,6 +118,11 @@ jobs:
         with:
           version: 4.0.11
 
+      # scons' GetRuntimePack needs modules/mono/SdkPackageVersions.props,
+      # normally emitted by build_assemblies.py (skipped here — no glue).
+      - name: Generate SdkPackageVersions.props
+        run: python -c "import sys; sys.path.insert(0, 'godot/modules/mono/build_scripts'); import build_assemblies; build_assemblies.generate_sdk_package_versions()"
+
       - name: Build Web Template
         run: scons -C godot platform=web target=${{ matrix.target }} module_mono_enabled=yes optimize=speed ccflags="-DNDEBUG"
 
