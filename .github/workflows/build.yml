@@ -16,7 +16,7 @@ on:
         type: boolean
         default: true
       publish_release:
-        description: Package the Windows zip and publish a GitHub release (needs Windows + templates)
+        description: Publish the packaged Windows zip as a GitHub release
         type: boolean
         default: false
 
@@ -190,8 +190,10 @@ jobs:
           name: godot.web.${{ matrix.target }}.wasm32.mono
           path: godot/bin/godot.web.${{ matrix.target }}.wasm32.mono.zip
 
+  # Packages whenever its inputs were built; publishing is gated separately so
+  # a validation run still exercises this job.
   build-final-zip:
-    if: ${{ inputs.publish_release }}
+    if: ${{ inputs.build_windows && inputs.build_templates }}
     runs-on: ubuntu-latest
 
     needs: [build-windows-editor, build-web-template]
